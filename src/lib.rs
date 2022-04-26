@@ -5,10 +5,17 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 const CONTENTION_THRESHOLD: usize = 2;
 const RETRY_THRESHOLD: usize = 2;
 
+pub struct Contention;
+
 pub struct ContentionMeasure(usize);
 impl ContentionMeasure {
-    pub fn detected(&mut self) -> Result<(), usize> {
+    pub fn detected(&mut self) -> Result<(), Contention> {
         self.0 += 1;
+        if self.0 > CONTENTION_THRESHOLD {
+            Ok(())
+        } else {
+            Err(Contention)
+        }
     }
 
     pub fn use_slow_path(&self) -> bool {
@@ -33,13 +40,17 @@ pub trait NormalizedLockFree {
     type Cas: CasDescriptor;
     type Cases: CasDescriptors<Self::Cas> + Clone;
 
-    fn generator(&self, op: &Self::Input, contention: &mut ContentionMeasure) -> Self::Cases;
+    fn generator(
+        &self,
+        op: &Self::Input,
+        contention: &mut ContentionMeasure,
+    ) -> Result<Self::Cases, Contention>;
     fn wrap_up(
         &self,
         executed: Result<(), usize>,
         performed: &Self::Cases,
         contention: &mut ContentionMeasure,
-    ) -> Result<Self::Output, ()>;
+    ) -> Result<Option<Self::Output>, Contention>;
 }
 
 pub struct OperationRecordBox<LF: NormalizedLockFree> {
@@ -94,6 +105,8 @@ impl<LF: NormalizedLockFree> WaitFreeSimulator<LF> {
     ) -> Result<(), usize> {
         let len = descriptors.len();
         for i in 0..len {
+            // TODO: Check if already completed.
+            // Implement fig.5
             if descriptors[i].execute().is_err() {
                 contention.detected();
                 return Err(i);
@@ -112,9 +125,15 @@ impl<LF: NormalizedLockFree> WaitFreeSimulator<LF> {
                     return;
                 }
                 OperationState::PreCas => {
-                    let cas_list = self
+                    let cas_list = match self
                         .algorithm
-                        .generator(&or.input, &mut ContentionMeasure(0));
+                        .generator(&or.input, &mut ContentionMeasure(0))
+                    {
+                        Ok(cas_list) => cas_list,
+                        Err(Contention) => {
+                            continue;
+                        }
+                    };
                     Box::new(OperationRecord {
                         owner: or.owner.clone(),
                         input: or.input.clone(),
@@ -130,22 +149,27 @@ impl<LF: NormalizedLockFree> WaitFreeSimulator<LF> {
                     })
                 }
                 OperationState::PostCas(cas_list, outcome) => {
-                    if let Ok(result) =
-                        self.algorithm
-                            .wrap_up(*outcome, cas_list, &mut ContentionMeasure(0))
+                    match self
+                        .algorithm
+                        .wrap_up(*outcome, cas_list, &mut ContentionMeasure(0))
                     {
-                        Box::new(OperationRecord {
+                        Ok(Some(result)) => Box::new(OperationRecord {
                             owner: or.owner.clone(),
                             input: or.input.clone(),
                             state: OperationState::Completed(result),
-                        })
-                    } else {
-                        // we need to start from the generator
-                        Box::new(OperationRecord {
-                            owner: or.owner.clone(),
-                            input: or.input.clone(),
-                            state: OperationState::PreCas,
-                        })
+                        }),
+                        Ok(None) => {
+                            // we need to start from the generator
+                            Box::new(OperationRecord {
+                                owner: or.owner.clone(),
+                                input: or.input.clone(),
+                                state: OperationState::PreCas,
+                            })
+                        }
+                        Err(Contention) => {
+                            // Not up to us to re-start.
+                            continue;
+                        }
                     }
                 }
             };
@@ -153,7 +177,7 @@ impl<LF: NormalizedLockFree> WaitFreeSimulator<LF> {
 
             if orb
                 .val
-                .compare_exchange(
+                .compare_exchange_weak(
                     or as *const OperationRecord<_> as *mut OperationRecord<_>,
                     updated_or,
                     Ordering::SeqCst,
@@ -188,8 +212,9 @@ impl<LF: NormalizedLockFree> WaitFreeSimulator<LF> {
             }
             let result = self.cas_execute(&cases, &mut contention);
             match self.algorithm.wrap_up(result, &cases, &mut contention) {
-                Ok(outcome) => return outcome,
-                Err(()) => {}
+                Ok(Some(outcome)) => return outcome,
+                Ok(None) => {}
+                Err(Contention) => {}
             }
             if contention.use_slow_path() {
                 break;
