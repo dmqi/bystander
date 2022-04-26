@@ -1,12 +1,13 @@
+use std::marker::PhantomData;
 use std::ops::Index;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, Ordering};
 
 const CONTENTION_THRESHOLD: usize = 2;
 const RETRY_THRESHOLD: usize = 2;
 
 pub struct ContentionMeasure(usize);
 impl ContentionMeasure {
-    pub fn detected(&mut self) {
+    pub fn detected(&mut self) -> Result<(), usize> {
         self.0 += 1;
     }
 
@@ -27,10 +28,10 @@ where
 }
 
 pub trait NormalizedLockFree {
-    type Input;
-    type Output;
+    type Input: Clone;
+    type Output: Clone;
     type Cas: CasDescriptor;
-    type Cases: CasDescriptors<Self::Cas>;
+    type Cases: CasDescriptors<Self::Cas> + Clone;
 
     fn generator(&self, op: &Self::Input, contention: &mut ContentionMeasure) -> Self::Cases;
     fn wrap_up(
@@ -41,29 +42,48 @@ pub trait NormalizedLockFree {
     ) -> Result<Self::Output, ()>;
 }
 
-pub struct OperationRecord {
-    completed: AtomicBool,
-    at: AtomicUsize,
+pub struct OperationRecordBox<LF: NormalizedLockFree> {
+    val: AtomicPtr<OperationRecord<LF>>,
+}
+
+enum OperationState<LF: NormalizedLockFree> {
+    PreCas,
+    ExecuteCas(LF::Cases),
+    PostCas(LF::Cases, Result<(), usize>),
+    Completed(LF::Output),
+}
+
+struct OperationRecord<LF: NormalizedLockFree> {
+    owner: std::thread::ThreadId,
+    input: LF::Input,
+    state: OperationState<LF>,
 }
 
 // A wait-free queue
-pub struct HelpQueue;
+struct HelpQueue<LF> {
+    _o: PhantomData<LF>,
+}
 
-impl HelpQueue {
-    pub fn enqueue(&self, help: *const OperationRecord) {}
+impl<LF: NormalizedLockFree> HelpQueue<LF> {
+    // TODO: Implement based on Appendix A
+    fn enqueue(&self, help: *const OperationRecordBox<LF>) {
+        let _ = help;
+        todo!()
+    }
 
-    pub fn peek(&self) -> Option<*const OperationRecord> {
+    fn peek(&self) -> Option<*const OperationRecordBox<LF>> {
         None
     }
 
-    pub fn try_remove_front(&self, completed: *const OperationRecord) -> Result<(), ()> {
+    fn try_remove_front(&self, front: *const OperationRecordBox<LF>) -> Result<(), ()> {
+        let _ = front;
         Err(())
     }
 }
 
 pub struct WaitFreeSimulator<LF: NormalizedLockFree> {
     algorithm: LF,
-    help: HelpQueue,
+    help: HelpQueue<LF>,
 }
 
 impl<LF: NormalizedLockFree> WaitFreeSimulator<LF> {
@@ -82,22 +102,85 @@ impl<LF: NormalizedLockFree> WaitFreeSimulator<LF> {
         todo!()
     }
 
+    // Guarantees that on return, orb is no longer in the help queue.
+    fn help_op(&self, orb: &OperationRecordBox<LF>) {
+        loop {
+            let or = unsafe { &*orb.val.load(Ordering::SeqCst) };
+            let updated_or = match &or.state {
+                OperationState::Completed(..) => {
+                    let _ = self.help.try_remove_front(orb);
+                    return;
+                }
+                OperationState::PreCas => {
+                    let cas_list = self
+                        .algorithm
+                        .generator(&or.input, &mut ContentionMeasure(0));
+                    Box::new(OperationRecord {
+                        owner: or.owner.clone(),
+                        input: or.input.clone(),
+                        state: OperationState::ExecuteCas(cas_list),
+                    })
+                }
+                OperationState::ExecuteCas(cas_list) => {
+                    let outcome = self.cas_execute(cas_list, &mut ContentionMeasure(0));
+                    Box::new(OperationRecord {
+                        owner: or.owner.clone(),
+                        input: or.input.clone(),
+                        state: OperationState::PostCas(cas_list.clone(), outcome),
+                    })
+                }
+                OperationState::PostCas(cas_list, outcome) => {
+                    if let Ok(result) =
+                        self.algorithm
+                            .wrap_up(*outcome, cas_list, &mut ContentionMeasure(0))
+                    {
+                        Box::new(OperationRecord {
+                            owner: or.owner.clone(),
+                            input: or.input.clone(),
+                            state: OperationState::Completed(result),
+                        })
+                    } else {
+                        // we need to start from the generator
+                        Box::new(OperationRecord {
+                            owner: or.owner.clone(),
+                            input: or.input.clone(),
+                            state: OperationState::PreCas,
+                        })
+                    }
+                }
+            };
+            let updated_or = Box::into_raw(updated_or);
+
+            if orb
+                .val
+                .compare_exchange(
+                    or as *const OperationRecord<_> as *mut OperationRecord<_>,
+                    updated_or,
+                    Ordering::SeqCst,
+                    Ordering::Relaxed,
+                )
+                .is_err()
+            {
+                // Never got shared, so safe to drop.
+                let _ = unsafe { Box::from_raw(updated_or) };
+            }
+        }
+    }
+
     fn help_first(&self) {
-        if let Some(help) = self.help.peek() {}
+        if let Some(help) = self.help.peek() {
+            self.help_op(unsafe { &*help });
+        }
     }
 
     pub fn run(&self, op: LF::Input) -> LF::Output {
+        let help = true;
+        if help {
+            self.help_first();
+        }
+
         // fast path
         for retry in 0.. {
-            if retry == 0 {
-                let help = true;
-                if help {
-                    self.help_first();
-                }
-            } else {
-                // help more
-            }
-
             let mut contention = ContentionMeasure(0);
             let cases = self.algorithm.generator(&op, &mut contention);
             if contention.use_slow_path() {
@@ -117,17 +200,23 @@ impl<LF: NormalizedLockFree> WaitFreeSimulator<LF> {
             }
         }
         // slow path: ask for help.
-        let i = 0;
-        let or = OperationRecord {
-            completed: AtomicBool::new(false),
-            at: AtomicUsize::new(i),
+        let orb = OperationRecordBox {
+            val: AtomicPtr::new(Box::into_raw(Box::new(OperationRecord {
+                owner: std::thread::current().id(),
+                input: op,
+                state: OperationState::PreCas,
+            }))),
         };
-        self.help.enqueue(&or);
-        while !or.completed.load(Ordering::SeqCst) {
-            self.help_first();
+        self.help.enqueue(&orb);
+        loop {
+            let or = unsafe { &*orb.val.load(Ordering::SeqCst) };
+            if let OperationState::Completed(t) = &or.state {
+                t.clone();
+                todo!()
+            } else {
+                self.help_first();
+            }
         }
-
-        todo!()
     }
 }
 
